@@ -5,6 +5,8 @@ Author: Giuseppe P Gava, 01/03/2022
 '''
 
 import numpy as np
+import torch
+import networkx as nx
 
 
 ### Utility functions
@@ -234,3 +236,180 @@ def intrinsic_dimensionality(points, nstep=10, metric='euclidean', dist_mat=None
         sns.despine()
 
     return Nneigh, radii, p
+
+
+### Barcode sequence encoding
+def encode_sequence(seq):
+    """
+    Convert DNA sequence to numerical encoding.
+    A=0, T=1, C=2, G=3
+    Removes trailing '-1' if present.
+    
+    Inputs:
+        seq: DNA sequence string (e.g., 'AAACCCAAGGCGATAC-1')
+    
+    Outputs:
+        encoded: torch tensor with encoded values
+    """
+    # Remove trailing '-1' if present
+    if seq.endswith('-1'):
+        seq = seq[:-2]
+    
+    # Mapping dictionary
+    mapping = {'A': 0, 'T': 1, 'C': 2, 'G': 3}
+    
+    # Encode sequence
+    encoded = [mapping[base] for base in seq]
+    
+    # Convert to torch tensor
+    return torch.tensor(encoded, dtype=torch.long)
+
+
+def euclidean_distance(vec1, vec2):
+    """
+    Calculate Euclidean distance between two vectors in R^16.
+    
+    Inputs:
+        vec1: torch tensor of shape (16,)
+        vec2: torch tensor of shape (16,)
+    
+    Outputs:
+        distance: float, Euclidean distance
+    """
+    return torch.norm(vec1.float() - vec2.float()).item()
+
+
+def build_barcode_graph(barcodes_file, add_edges=False, distance_threshold=None):
+    """
+    Build a graph where each node is a barcode sequence converted to a tensor.
+    Each node is a point in R^16 with values 0-3 (corresponding to A, T, C, G).
+    
+    Inputs:
+        barcodes_file: Path to barcodes.tsv file
+        add_edges: If True, add edges between similar sequences
+        distance_threshold: If add_edges=True, only add edges between nodes
+                           with Euclidean distance <= threshold
+    
+    Outputs:
+        G: NetworkX graph where node attributes contain encoded tensors
+        encoded_sequences: Dictionary mapping node ID to encoded tensor
+    """
+    # Create graph
+    G = nx.Graph()
+    encoded_sequences = {}
+    
+    # Read barcodes from file
+    with open(barcodes_file, 'r') as f:
+        barcodes = [line.strip() for line in f]
+    
+    # Add nodes with encoded sequences
+    for idx, barcode in enumerate(barcodes):
+        encoded = encode_sequence(barcode)
+        G.add_node(idx, sequence=barcode, encoded=encoded)
+        encoded_sequences[idx] = encoded
+    
+    # Add edges based on distance if requested
+    if add_edges and distance_threshold is not None:
+        node_ids = list(G.nodes())
+        for i in range(len(node_ids)):
+            for j in range(i + 1, len(node_ids)):
+                node_i = node_ids[i]
+                node_j = node_ids[j]
+                vec_i = encoded_sequences[node_i]
+                vec_j = encoded_sequences[node_j]
+                dist = euclidean_distance(vec_i, vec_j)
+                
+                if dist <= distance_threshold:
+                    G.add_edge(node_i, node_j, weight=dist)
+    
+    return G, encoded_sequences
+
+
+def compute_degree_matrix(G):
+    """
+    Compute the degree matrix of a graph.
+    D is a diagonal matrix where D[i,i] = degree of node i.
+    
+    Inputs:
+        G: NetworkX graph
+    
+    Outputs:
+        D: torch tensor, degree matrix (n x n)
+    """
+    n = G.number_of_nodes()
+    D = torch.zeros((n, n), dtype=torch.float32)
+    
+    for node in G.nodes():
+        degree = G.degree(node)
+        D[node, node] = degree
+    
+    return D
+
+
+def compute_adjacency_matrix(G):
+    """
+    Compute the adjacency matrix of a graph.
+    A[i,j] = weight of edge (i,j) if edge exists, else 0.
+    
+    Inputs:
+        G: NetworkX graph
+    
+    Outputs:
+        A: torch tensor, adjacency matrix (n x n)
+    """
+    n = G.number_of_nodes()
+    A = torch.zeros((n, n), dtype=torch.float32)
+    
+    for u, v, data in G.edges(data=True):
+        weight = data.get('weight', 1.0)
+        A[u, v] = weight
+        A[v, u] = weight
+    
+    return A
+
+
+def compute_laplacian_matrix(G):
+    """
+    Compute the graph Laplacian matrix.
+    L = D - A, where D is the degree matrix and A is the adjacency matrix.
+    
+    Inputs:
+        G: NetworkX graph
+    
+    Outputs:
+        L: torch tensor, Laplacian matrix (n x n)
+    """
+    D = compute_degree_matrix(G)
+    A = compute_adjacency_matrix(G)
+    L = D - A
+    
+    return L, D, A
+
+
+def spectral_embedding(G, n_components=3):
+    """
+    Perform spectral embedding using Laplacian eigenvectors.
+    Reduces node embeddings to n_components dimensions using the smallest
+    non-zero eigenvalues and their corresponding eigenvectors.
+    
+    Inputs:
+        G: NetworkX graph
+        n_components: int, number of dimensions to embed to (default: 3)
+    
+    Outputs:
+        embedding: torch tensor of shape (n_nodes, n_components)
+                  where each row is the embedding of a node
+        eigenvalues: torch tensor of Laplacian eigenvalues
+        eigenvectors: torch tensor of Laplacian eigenvectors
+    """
+    # Compute Laplacian
+    L, _, _ = compute_laplacian_matrix(G)
+    
+    # Compute eigendecomposition
+    eigenvalues, eigenvectors = torch.linalg.eigh(L)
+    
+    # Use the smallest n_components+1 eigenvectors (skip the first one which is ~0)
+    # The first eigenvector corresponds to eigenvalue 0 (trivial solution)
+    embedding = eigenvectors[:, 1:n_components+1]
+    
+    return embedding, eigenvalues, eigenvectors
